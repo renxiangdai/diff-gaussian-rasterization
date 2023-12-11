@@ -14,7 +14,7 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
-
+const int CLASS = 80;
 // Forward method for converting the input spherical harmonics
 // coefficients of each Gaussian to a simple RGB color.
 __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const glm::vec3* means, glm::vec3 campos, const float* shs, bool* clamped)
@@ -159,6 +159,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* labels,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -175,6 +176,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
+	float* geo_labels,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -198,6 +200,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+	// printf("p_proj: %f %f %f\n", p_proj.x, p_proj.y, p_proj.z);
 
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters. 
@@ -231,6 +234,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
 	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	// printf("point_image: %f %f\n", point_image.x, point_image.y);
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
@@ -252,6 +256,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
+	// print labels
+	// printf("label: %f\n", labels[idx]);
+	geo_labels[idx] = labels[idx];
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
@@ -267,11 +274,13 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ geo_labels,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
-{
+	float* __restrict__ out_color,
+	float* __restrict__ out_label)
+{	
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -280,7 +289,6 @@ renderCUDA(
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y };
-
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
@@ -301,10 +309,11 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
-
+	float L[CLASS] = { 0 };
+	// printf("I am done init\n");
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
-	{
+	{	
 		// End if entire block votes that it is done rasterizing
 		int num_done = __syncthreads_count(done);
 		if (num_done == BLOCK_SIZE)
@@ -318,6 +327,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			// printf("label: %f\n", geo_labels[coll_id]);
 		}
 		block.sync();
 
@@ -353,15 +363,18 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
-
+			
+			for (int cl = 0; cl < CLASS; cl++)
+				L[cl] += geo_labels[collected_id[j] * CLASS + cl] * alpha * T;
 			T = test_T;
-
+			// print geo_labels
+			// printf("label: %f\n", geo_labels[collected_id[j] * CLASS + 0]);
 			// Keep track of last range entry to update this
 			// pixel.
 			last_contributor = contributor;
 		}
 	}
-
+	// printf("I am in xunhuan\n");
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
 	if (inside)
@@ -370,6 +383,9 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		
+		for (int cl = 0; cl < CLASS; cl++)
+			out_label[cl * H * W + pix_id] = L[cl];
 	}
 }
 
@@ -381,10 +397,12 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
+	const float* geo_labels,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
-	float* out_color)
+	float* out_color,
+	float* out_label)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -393,10 +411,12 @@ void FORWARD::render(
 		means2D,
 		colors,
 		conic_opacity,
+		geo_labels,
 		final_T,
 		n_contrib,
 		bg_color,
-		out_color);
+		out_color,
+		out_label);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -405,6 +425,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* labels,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -421,6 +442,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* cov3Ds,
 	float* rgb,
 	float4* conic_opacity,
+	float* geo_labels,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -432,6 +454,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		scale_modifier,
 		rotations,
 		opacities,
+		labels,
 		shs,
 		clamped,
 		cov3D_precomp,
@@ -448,6 +471,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		cov3Ds,
 		rgb,
 		conic_opacity,
+		geo_labels,
 		grid,
 		tiles_touched,
 		prefiltered

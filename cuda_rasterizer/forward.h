@@ -27,6 +27,7 @@ namespace FORWARD
 		const float scale_modifier,
 		const glm::vec4* rotations,
 		const float* opacities,
+		const float* labels,
 		const float* shs,
 		bool* clamped,
 		const float* cov3D_precomp,
@@ -43,6 +44,7 @@ namespace FORWARD
 		float* cov3Ds,
 		float* colors,
 		float4* conic_opacity,
+		float* geo_labels,
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		bool prefiltered);
@@ -56,10 +58,12 @@ namespace FORWARD
 		const float2* points_xy_image,
 		const float* features,
 		const float4* conic_opacity,
+		const float* geo_labels,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
-		float* out_color);
+		float* out_color,
+		float* out_label);
 }
 
 

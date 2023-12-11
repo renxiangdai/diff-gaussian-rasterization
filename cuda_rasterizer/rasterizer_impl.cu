@@ -83,7 +83,7 @@ __global__ void duplicateWithKeys(
 
 	// Generate no key/value pair for invisible Gaussians
 	if (radii[idx] > 0)
-	{
+	{	
 		// Find this Gaussian's offset in buffer for writing keys/values.
 		uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
 		uint2 rect_min, rect_max;
@@ -161,6 +161,7 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.means2D, P, 128);
 	obtain(chunk, geom.cov3D, P * 6, 128);
 	obtain(chunk, geom.conic_opacity, P, 128);
+	obtain(chunk, geom.geo_labels, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
@@ -206,6 +207,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* shs,
 	const float* colors_precomp,
 	const float* opacities,
+	const float* labels,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -216,9 +218,11 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	float* out_label,
 	int* radii,
 	bool debug)
-{
+{	
+	// printf("I am in forward 224\n");
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
@@ -243,7 +247,7 @@ int CudaRasterizer::Rasterizer::forward(
 	{
 		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
 	}
-
+	// printf("I am in forward 250\n");
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
@@ -252,6 +256,7 @@ int CudaRasterizer::Rasterizer::forward(
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
+		labels,
 		shs,
 		geomState.clamped,
 		cov3D_precomp,
@@ -267,23 +272,30 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.cov3D,
 		geomState.rgb,
 		geomState.conic_opacity,
+		geomState.geo_labels,
 		tile_grid,
 		geomState.tiles_touched,
 		prefiltered
 	), debug)
-
+	// printf("I am done with preprocess\n");
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
-
+	// printf("I am done with cub\n");
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
+	
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
-
+	// printf("num_rendered: %d\n", num_rendered);
+	// printf("I am done with cudaMemcpy\n");
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	// printf("I am done with required\n");
+	// print size of binning_chunk_size
+	// printf("binning_chunk_size: %d\n", binning_chunk_size);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	// printf("I am done with binningBuffer\n");
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
-
+	// printf("I am done with binning\n");
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
@@ -308,7 +320,6 @@ int CudaRasterizer::Rasterizer::forward(
 		num_rendered, 0, 32 + bit), debug)
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
-
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
 		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
@@ -316,7 +327,7 @@ int CudaRasterizer::Rasterizer::forward(
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(, debug)
-
+	// printf("I am done with identifyTileRanges\n");
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	CHECK_CUDA(FORWARD::render(
@@ -327,10 +338,12 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
+		geomState.geo_labels,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
-		out_color), debug)
+		out_color,
+		out_label), debug)
 
 	return num_rendered;
 }
